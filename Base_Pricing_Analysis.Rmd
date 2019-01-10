@@ -1,0 +1,748 @@
++---
+title: "Base Pricing Analysis and Price Elasticity Estimation"
+author: "Aziz Abdul Malik"
+date: "February 2018"
+output: html_document
+urlcolor: blue
+graphics: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, message = FALSE,
+                      fig.width = 4.5, fig.height = 3, fig.align = "right")
+
+stargazer_type = "latex"    # "text" for running in Notebook mode, "latex" when creating a pdf document.
+```
+
+
+
+## Overview
+
+The goal is to conduct a base pricing analysis. I will estimate brand-level demand using scanner data, and then make profitability predictions corresponding to specific base price changes. I will estimate log-linear demand models that use (log) prices and promotions as inputs, and predict log quantities, `log(1+Q)`. The models predict the demand for a focal brand, and I control for (log) prices and promotions of three competitors. Obviously, this approach generalizes to an arbitrarily large number of competing products as long as the sample size is large enough.
+
+My focus is on the two top brands in the liquid laundry detergent category, *Tide* and *Gain*. Both are Procter & Gamble brands. The two closest competitors are *Arm & Hammer* and *Purex*.
+
+
+
+\bigskip
+
+## Packages
+
+
+```{r}
+library(bit64)
+library(data.table)
+library(lfe)
+library(knitr)
+library(stargazer)
+library(ggplot2)
+library(gplots)
+
+```
+
+
+
+\newpage
+
+## Data overview
+
+The data source is an extract from the Nielsen RMS retail scanner data set. The data set captures weekly price and quantity data for all products (UPC's) sold in the stores of a large number of U.S. retail chains. The Kilts data do not include all retailers (for example, Walmart is not part of the data), and the identity of the retailers is not revealed. However, what is known is whether a store belongs to the same retail chain.
+
+
+\newpage
+
+## Prepare the data for the demand analysis
+
+I first load the brand and store meta data.
+
+```{r}
+load("./Data/Brands.RData")
+load("./Data/Stores.RData")
+```
+
+
+#### Select the category and brands
+
+
+```{r}
+selected_module = 7012                 # Laundry detergent
+
+selected_brands = brands[product_module_code == selected_module]
+selected_brands = selected_brands[order(-revenue)]
+selected_brands = selected_brands[1:4]
+
+```
+
+Let's assign each brand a new name using a new variable, `brand_name`, and give the four brands simple names such as `Tide`, `Gain`, `ArmHammer`, and `Purex`. These simplified brand names will make the code and the estimation output more readable.
+
+```{r, results = "hide"}
+selected_brands[, brand_name := c("Tide", "Gain", "ArmHammer", "Purex")]
+```
+
+```{r}
+head(selected_brands)
+```
+
+
+
+#### Prepare the movement data
+
+Load the movement data, and---for better readability---change the variable names from `units` to `quantity` and from `promo_dummy` to `promotion`. Finally, merge the new `brand_name` variable with the movement table.
+
+```{r, results = "hide"}
+load(paste0("./Data/brand_move_", selected_module, ".RData"))
+
+setnames(move, c("units", "promo_dummy"), c("quantity", "promotion"))
+
+move[, promotion := as.numeric(promotion)]
+move = merge(move, selected_brands[, .(brand_code_uc, brand_name)],
+             by = "brand_code_uc")
+```
+
+```{r}
+head(move)
+
+```
+
+
+
+#### Remove outliers
+
+
+```{r}
+isOutlier <- function(x, threshold_bottom, threshold_top) {
+   is_outlier = rep(FALSE, times = length(x))
+   median_x   = median(x, na.rm = TRUE)
+   is_outlier[x/median_x < threshold_bottom | x/median_x > threshold_top] = TRUE
+   return(is_outlier)
+}
+```
+
+
+
+
+
+```{r}
+move[, is_outlier := isOutlier(price, 0.35, 2.5), by = .(brand_code_uc, store_code_uc)]
+table(move$is_outlier)
+move = move[is_outlier == FALSE][, is_outlier := NULL]
+```
+
+
+#### Reshape the movement data from long to wide format
+
+
+
+```{r}
+move = dcast(move, store_code_uc + week_end ~ brand_name, 
+             value.var = c("quantity", "price", "promotion"))
+head(move)
+
+```
+
+
+#### Merge store information with the movement data
+
+Now merge the movement data with the store meta data, in particular with the retailer code, the Scantrack (SMM) market code, and the Scantrack market description. But only with the store meta data where I have a valid retailer code. Hence, I need to remove store data if the retailer code is missing (`NA`). Use the `is.na` function to check if `retailer_code` is `NA` or not.
+
+```{r}
+stores = stores[is.na(retailer_code) == FALSE]
+
+move = merge(stores[, .(store_code_uc, retailer_code, SMM_code, SMM_description)], move, 
+             by = "store_code_uc")
+
+
+```
+
+
+#### Create time variables or trends
+
+A time trend records the progress of time. For example, a time trend at the week-level may equal 1 in the first week in the data, 2 in the second week, etc., whereas a trend at the month-level may equal 1 in the first month, 2 in the second month, etc.
+
+I will create a monthly time trend. Use the functions `year` and `month` to extract the year and month components of the week (`week_end`) variable in the movement data 
+
+```{r, results = "hide"}
+move[, `:=`(year = year(week_end), month = month(week_end))]
+move[, month_index := 12*(year - min(year)) + month]
+
+move[, month_index := as.integer(month_index)]
+
+```
+
+
+#### Remove missing values
+
+Finally, retain only complete cases, i.e. rows without missing values:
+
+```{r}
+move = move[complete.cases(move)]
+
+move[, store_code_uc := as.factor(store_code_uc)]
+move[, year := as.factor(year)]
+
+```
+
+
+
+\newpage
+
+## Data inspection
+
+
+#### Observations and geographic coverage
+
+
+Number of observations:
+
+```{r}
+nrow(move)
+
+```
+
+Number of stores:
+
+```{r}
+
+length(unique(move$store_code_uc))
+
+```
+
+\bigskip
+
+Second, I assesss if the included stores have broad geographic coverage. I hence create a summary table that records the number of observations for each separate Scantrack market:
+
+```{r}
+market_coverage = move[, .(n_obs = .N), by = SMM_description]
+```
+
+
+
+\medskip
+
+
+
+```{r}
+kable(market_coverage, col.names = c("Scantrack market", "No. obs."))
+```
+
+
+#### Price variation
+
+Before estimating the demand models I would like to understand the degree of price variation in the data. 
+
+I will predict demand for Tide and Gain. For each of these two brands separately, I would like to visualize the overall degree of price variation across observations, and also the variation in relative prices with respect to the competing brands.
+
+
+\newpage
+
+
+
+```{r, warning=FALSE}
+
+move2<-move[store_code_uc %in% as.data.frame(unique(move$store_code_uc))[ 1:10,]]
+
+move2$store_code_uc<-as.factor(move2$store_code_uc)
+
+
+#Store and Quantity
+ggplot(move2, aes(x = store_code_uc, y = quantity_Tide), xlab='Store', ylab="Quantity") +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Quantity - Tide") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and quantity")+
+  theme_bw()
+
+ggplot(move2, aes(x = store_code_uc, y = quantity_Gain), xlab='Store', ylab="Quantity") +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Quantity - Gain") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and quantity")+
+  theme_bw()
+  
+ggplot(move2, aes(x = store_code_uc, y = quantity_ArmHammer), xlab='Store', ylab="Quantity") +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Quantity - Arm Hammer") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and quantity")+
+  theme_bw()
+
+
+ggplot(move2, aes(x = store_code_uc, y = quantity_Purex), xlab='Store', ylab="Quantity") +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Quantity - Purex") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and quantity")+
+  theme_bw()
+
+
+#Store and Price
+
+ggplot(move2, aes(x = store_code_uc, y = price_Tide)) +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Price - Tide") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and price")+
+  theme_bw()
+  
+
+ggplot(move2, aes(x = store_code_uc, y = price_Gain)) +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Price - Gain") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and price")+
+  theme_bw()
+
+ggplot(move2, aes(x = store_code_uc, y = price_ArmHammer)) +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Price - Arm Hammer") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and price")+
+  theme_bw()
+
+ggplot(move2, aes(x = store_code_uc, y = price_Purex)) +
+   geom_boxplot(fill  = "lightsteelblue2", color = "grey60") + 
+  ylab("Price - Purex") +
+  xlab("Store") +
+ggtitle("Heterogenity across stores and price")+
+  theme_bw()
+
+
+
+```
+
+
+
+
+##### Tide
+
+```{r}
+mean_price_Tide = mean(move$price_Tide)
+ggplot(move, aes(x = price_Tide/mean_price_Tide)) +
+   geom_histogram(binwidth = 0.05, center = 0.05/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0.5, 2), breaks = seq(0.5, 2, 0.1), minor_breaks = seq(0.5, 2, 0.1)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Tide/price_Gain)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Tide/price_ArmHammer)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Tide/price_Purex)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+\newpage
+
+##### Gain
+
+```{r}
+mean_price_Gain = mean(move$price_Gain)
+ggplot(move, aes(x = price_Gain/mean_price_Gain)) +
+   geom_histogram(binwidth = 0.05, center = 0.05/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0.5, 2), breaks = seq(0.5, 2, 0.1), minor_breaks = seq(0.5, 2, 0.1)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Gain/price_Tide)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Gain/price_ArmHammer)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+```{r}
+ggplot(move, aes(x = price_Gain/price_Purex)) +
+   geom_histogram(binwidth = 0.1, center = 0.1/2, fill  = "lightsteelblue2", color = "grey60", size  = 0.2) +
+   scale_x_continuous(limits = c(0, 5), breaks = seq(0, 5, 0.5), minor_breaks = seq(0, 5, 0.5)) +
+   theme_bw()
+```
+
+\newpage
+
+
+
+#### Summary of data inspection
+
+Even though only an extract of the RMS data (not the whole data base) is used for the analysis, I observe a large number of stores with a total of about 1.25 million weekly observations. The stores cover all regions of the United States.
+
+
+
+\newpage
+
+
+To predict profits I need to predict demand using the regression output.
+
+```{r}
+source("./predict.felm.R")
+```
+
+\bigskip
+
+
+###Split Data
+
+```{r}
+
+set.seed(1)
+split_index=sample(x=1259352, size = 1196385)
+
+move_train<-move[split_index]
+move_predict = move[-split_index]
+
+```
+
+
+## Estimation
+
+Now I are ready to estimate demand models for Tide and Gain.
+
+I want to estimate a sequence of models with an increasing number of controls and compare the stability of the key results across these models. In all models the output is `log(1+quantity_<brand name>)`.
+
+\bigskip
+
+To keep things simple, I will initially estimate demand for Tide only.
+
+Let's start with the following models:
+
+1. log of own price as only input
+2. Add store fixed effects
+3. Add a time trend---maybe linear, or a polynomial with higher-order terms
+4. Instead of a time trend add fixed effects for each month (more precisely: for each year/month combination)
+
+
+#### Base model with and without store and time controls
+
+```{r, warning = FALSE}
+
+# Base model: Own price only
+model_base     = "log(1+quantity_Tide) ~ log(price_Tide)"
+fit_base       = felm(formula(model_base), move_train)
+
+# Add store fixed effects
+FE_store       = "| store_code_uc"
+fit_store_FE   = felm(formula(paste(model_base, FE_store)), move_train)
+
+# Add trend
+model_trend    = paste(model_base, "+ poly(month_index,3)")
+fit_trend      = felm(formula(paste(model_trend, FE_store)), move_train)
+
+# Instead of a trend, add year/month fixed effects
+FE_store_month = "| store_code_uc + month_index"
+fit_month_FE   = felm(formula(paste(model_base, FE_store_month)), move_train)
+
+#FE = getfe(fit_store_FE, se = TRUE)
+#head(FE)
+
+```
+
+
+\bigskip
+
+
+
+```{r, results = "asis"}
+stargazer(fit_base, fit_store_FE, fit_trend, fit_month_FE, 
+          type  = stargazer_type,
+          column.labels  = c("Base", "Store FE", "Trend", "Store + year/month FE"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+```
+
+
+
+\bigskip
+
+Remove the regression output objects that are no longer used, because they take up much space in memory:
+
+```{r}
+rm(fit_base, fit_store_FE, fit_trend)
+```
+
+I will keep `fit_month_FE` as the current preferred model for comparison.
+
+
+#### Controlling for competitor prices
+
+Now add the competitor prices to the demand model. Compare the results and comment on the cross-price elasticities.
+
+```{r, warning = FALSE, results = "asis"}
+
+model_comp = paste(model_base, "+ log(price_Gain) + log(price_ArmHammer) + log(price_Purex)")
+fit_comp   = felm(formula(paste(model_comp, FE_store_month)), move_train)
+
+stargazer(fit_month_FE, fit_comp, 
+          type  = stargazer_type,
+          column.labels  = c("Store + year/month FE", "+ competitors"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+
+rm(fit_month_FE)
+```
+
+
+#### Controlling for promotions
+
+Now add the promotions dummies, first just for Tide, then for all brands. 
+
+```{r, warning = FALSE, results = "asis"}
+# Add own promotion
+model_promo    = paste(model_comp, "+ promotion_Tide")
+fit_promo      = felm(formula(paste(model_promo, FE_store_month)), move_train)
+
+
+
+# Add competitor promotions
+model_promo_comp = paste(model_promo,
+                      "+ promotion_Gain + promotion_ArmHammer + promotion_Purex")
+fit_promo_comp   = felm(formula(paste(model_promo_comp, FE_store_month)), move_train)
+
+
+
+
+stargazer(fit_comp, fit_promo, fit_promo_comp, 
+          type  = stargazer_type,
+          column.labels  = c("Competitors", "+ own promo", "+ comp. promo"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+
+rm(fit_comp, fit_promo)
+
+summary(fit_promo_comp)
+```
+
+
+\bigskip
+
+
+
+I will use the final model including all variables -  `fit_promo_comp` as the preferred model. To make this final model distinguishable from the regression output for Gain I will rename it:
+
+
+
+```{r}
+fit_Tide = fit_promo_comp
+```
+
+\medskip
+
+
+
+```{r}
+#save(fit_Tide, file = "fit_Tide.RData")
+```
+
+
+\bigskip
+
+
+
+
+#### Demand model for Gain
+
+Now I repeat the steps to estimate demand for Gain, and I store the final estimation output.
+
+```{r, warning = FALSE, results = "asis"}
+# Base model: Own price only
+model_base     = "log(1+quantity_Gain) ~ log(price_Gain)"
+fit_base       = felm(formula(model_base), move_train)
+
+# Add store fixed effects
+FE_store       = "| store_code_uc"
+fit_store_FE   = felm(formula(paste(model_base, FE_store)), move_train)
+
+# Add trend
+model_trend    = paste(model_base, "+ poly(month_index,3)")
+fit_trend      = felm(formula(paste(model_trend, FE_store)), move_train)
+
+# Instead of a trend, add year/month fixed effects
+FE_store_month = "| store_code_uc + month_index"
+fit_month_FE   = felm(formula(paste(model_base, FE_store_month)), move_train)
+
+stargazer(fit_base, fit_store_FE, fit_trend, fit_month_FE, 
+          type  = stargazer_type,
+          column.labels  = c("Base", "Store FE", "Trend", "Store + year/month FE"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+
+rm(fit_base, fit_store_FE, fit_trend)
+
+```
+
+```{r, warning = FALSE, results = "asis"}
+model_comp = paste(model_base, "+ log(price_Tide) + log(price_ArmHammer) + log(price_Purex)")
+fit_comp   = felm(formula(paste(model_comp, FE_store_month)), move_train)
+
+stargazer(fit_month_FE, fit_comp, 
+          type  = stargazer_type,
+          column.labels  = c("Store + year/month FE", "+ competitors"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+
+rm(fit_month_FE)
+```
+
+
+
+```{r, warning = FALSE, results = "asis"}
+# Add own promotion
+model_promo    = paste(model_comp, "+ promotion_Gain")
+fit_promo      = felm(formula(paste(model_promo, FE_store_month)), move_train)
+
+# Add competitor promotions
+model_promo_comp = paste(model_promo,
+                      "+ promotion_Tide + promotion_ArmHammer + promotion_Purex")
+fit_promo_comp   = felm(formula(paste(model_promo_comp, FE_store_month)), move_train)
+
+stargazer(fit_comp, fit_promo, fit_promo_comp, 
+          type  = stargazer_type,
+          column.labels  = c("Competitors", "+ own promo", "+ comp. promo"),
+          dep.var.labels.include = FALSE,
+          header = FALSE)
+
+
+
+summary(fit_promo_comp)
+rm(fit_comp, fit_promo)
+
+```
+
+\bigskip
+
+
+
+```{r}
+fit_Gain = fit_promo_comp 
+#save(fit_Gain, file = "fit_Gain.RData")
+```
+
+
+
+
+
+
+\newpage
+
+
+####Model Validation
+
+
+```{r}
+
+#Test
+Q_Tide = exp(predict(fit_Tide, move_predict)) - 1
+Q_Gain = exp(predict(fit_Gain, move_predict)) - 1
+
+cat("R-Squared in Validation:\n\n")
+cat("Tide\n")
+cor(move_predict$quantity_Tide, Q_Tide)^2
+cat("\nGain\n")
+cor(move_predict$quantity_Gain, Q_Gain)^2
+
+```
+
+
+## Profitability analysis
+
+The goal is to fine-tune prices jointly for Tide and Gain. I hence use the estimates of the preferred demand models and evaluate the product-line profits when I change the prices of the two brands.
+
+\bigskip
+
+
+Although I have excellent demand data, I do not know the production costs of the brands. I can infer the cost making an informed assumption on retail margins and the gross margin of the brand.  
+
+
+```{r}
+gross_margin  = 0.35
+retail_margin = 0.18
+
+cost_Tide = (1-gross_margin)*(1-retail_margin)*mean(move_predict$price_Tide)
+cost_Gain = (1-gross_margin)*(1-retail_margin)*mean(move_predict$price_Gain)
+```
+
+
+\bigskip
+
+Now I create a vector indicating the percentage price changes that I consider within an acceptable range, up to +/- ten percent.
+
+```{r}
+percentage_delta = seq(-0.1, 0.1, 0.05)    # Identical to = c(-0.1, -0.05, 0.0, 0.05, 0.1)
+```
+
+\bigskip
+
+I will consider all possible combinations of price changes for Tide and Gain. 
+
+```{r}
+L = length(percentage_delta)
+profit_DT = data.table(delta_Tide = rep(percentage_delta, each = L),
+                       delta_Gain = rep(percentage_delta, times = L),
+                       profit     = rep(0, times = L*L))
+```
+
+Inspect the resulting table. The `profit` column will allow us to store the predicted profits.
+
+\bigskip
+
+Now I am ready to iterate over each row in `profit_DT` and evaluate the total product-line profits of Tide and Gain for the corresponding percentage price changes.
+
+```{r}
+price_Tide_0 = move_predict$price_Tide
+price_Gain_0 = move_predict$price_Gain
+
+for (i in 1:nrow(profit_DT)) {
+   
+   move_predict[, `:=`(price_Tide = (1 + profit_DT[i, delta_Tide])*price_Tide_0,
+                       price_Gain = (1 + profit_DT[i, delta_Gain])*price_Gain_0)]
+   
+   Q_Tide = exp(predict(fit_Tide, move_predict)) - 1
+   Q_Gain = exp(predict(fit_Gain, move_predict)) - 1
+   
+   profit_Tide = sum(Q_Tide*(move_predict$price_Tide*(1-retail_margin) - cost_Tide))
+   profit_Gain = sum(Q_Gain*(move_predict$price_Gain*(1-retail_margin) - cost_Gain))
+   
+   profit_DT[i, profit := profit_Tide + profit_Gain]
+}
+
+```
+
+\bigskip
+
+Show a table of profits in levels and in ratios relative to the baseline profit at current price levels, in order to assess the percent profit differences resulting from the contemplated price changes.
+
+```{r, results = "hide"}
+profit_0 = profit_DT[delta_Tide == 0 & delta_Gain == 0, profit]
+profit_DT[, profit_ratio := profit/profit_0]
+```
+
+```{r}
+kable(profit_DT, digits = 4)
+```
+
+\bigskip
+
+Note that the profit levels are total yearly profits for the stores in the sample.
+
+
+
+
